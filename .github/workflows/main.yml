@@ -1,11 +1,9 @@
-- name: Run Debug Models
-        env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-        run: python debug_models.py
+- name: Install dependencies
+        run: pip install ccxt groq
 
       - name: Run Bot
         env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
         run: python bot.py
