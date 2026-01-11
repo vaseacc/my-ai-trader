@@ -2,92 +2,106 @@ import os
 import json
 import time
 import ccxt
+import traceback
 import google.generativeai as genai
 
 # 1. SETUP: AI & Exchange
-# These keys are pulled from your GitHub Secrets
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-model = genai.GenerativeModel('gemini-1.5-flash')
-
-# Connect to MEXC Exchange
-exchange = ccxt.mexc({
-    'apiKey': os.getenv("MEXC_API_KEY"),
-    'secret': os.getenv("MEXC_SECRET"),
-    'options': {'defaultType': 'spot'}
-})
+try:
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    # Using 1.5-flash which is the most reliable free-tier model
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    exchange = ccxt.mexc({
+        'apiKey': os.getenv("MEXC_API_KEY"),
+        'secret': os.getenv("MEXC_SECRET"),
+        'options': {'defaultType': 'spot'}
+    })
+except Exception as e:
+    print(f"INITIALIZATION ERROR: {e}")
 
 SYMBOL = 'BTC/USDT'
-TRADE_AMOUNT_USDT = 10  # Amount to spend per trade
+TRADE_AMOUNT_USDT = 10 
 
 def get_ai_decision(price):
-    """Ask Gemini to think like GCR"""
+    """Ask Gemini to think like GCR with safety filters disabled"""
+    print(f"Calling Google AI for price: {price}...")
+    
     prompt = f"""
-    You are GCR, the legendary crypto trader. You are known for elite market psychology.
-    The current price of Bitcoin (BTC) is {price} USDT.
-    
-    Analyze the market. Based on this price, would you BUY, SELL, or HOLD? 
-    Your goal is to be highly selective. Only trade if you are 90% confident.
-    
+    You are GCR, the legendary crypto trader. The current price of Bitcoin is {price} USDT.
+    Based on market psychology, would you BUY, SELL, or HOLD? 
     Respond ONLY in this JSON format:
-    {{
-        "action": "BUY", 
-        "confidence": 95, 
-        "reason": "Explain your logic in 1 sentence"
-    }}
+    {{"action": "BUY", "confidence": 95, "reason": "logic here"}}
     """
     
     try:
-        response = model.generate_content(prompt)
-        # Clean the AI response (removes markdown backticks if Gemini adds them)
+        # Safety settings to prevent Google from blocking "Financial Advice"
+        safety_settings = [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+        
+        response = model.generate_content(prompt, safety_settings=safety_settings)
+        
+        # DEBUG: Print the raw response to GitHub logs
+        print(f"Raw AI Response: {response.text}")
+        
+        # Clean the AI response
         text = response.text.strip().replace('```json', '').replace('```', '')
         return json.loads(text)
+        
     except Exception as e:
-        print(f"AI Error: {e}")
-        return {"action": "HOLD", "confidence": 0, "reason": "AI failed to respond."}
+        error_msg = f"AI Error: {str(e)}"
+        print(error_msg)
+        # This prints the full error "stack trace" to your GitHub logs
+        traceback.print_exc() 
+        return {"action": "HOLD", "confidence": 0, "reason": error_msg}
 
 def run_bot():
+    current_price = "Unknown"
+    decision = {"action": "ERROR", "confidence": 0, "reason": "Bot failed to run."}
+    
     try:
-        print(f"--- Bot starting. Checking {SYMBOL} ---")
-        
         # 2. GET MARKET DATA
+        print("Fetching market data from MEXC...")
         ticker = exchange.fetch_ticker(SYMBOL)
         current_price = ticker['last']
-        print(f"Current Price: {current_price}")
+        print(f"Success! Price is {current_price}")
 
         # 3. GET AI DECISION
         decision = get_ai_decision(current_price)
-        print(f"AI Decision: {decision['action']} (Confidence: {decision['confidence']}%)")
-        print(f"Reasoning: {decision['reason']}")
-
-        # 4. EXECUTION (Only if Confidence is 90% or higher)
-        # Note: These are commented out for your safety. 
-        # Remove the '#' when you are ready to trade real money.
+        
+        # 4. EXECUTION LOGIC
         if decision['confidence'] >= 90:
             if decision['action'] == "BUY":
-                print(">>> AI signaled BUY. Executing...")
+                print(">>> SIGNAL: BUY. (Orders are currently commented out for safety)")
                 # exchange.create_market_buy_order(SYMBOL, TRADE_AMOUNT_USDT)
-                
             elif decision['action'] == "SELL":
-                print(">>> AI signaled SELL. Executing...")
+                print(">>> SIGNAL: SELL. (Orders are currently commented out for safety)")
                 # exchange.create_market_sell_order(SYMBOL, TRADE_AMOUNT_USDT)
         else:
-            print("Confidence too low. No trade executed.")
+            print("Decision made: No trade (Confidence low).")
 
-        # 5. SAVE DATA FOR THE WEBSITE DASHBOARD
+    except Exception as e:
+        print(f"BOT CRITICAL ERROR: {e}")
+        traceback.print_exc()
+        decision = {"action": "HOLD", "confidence": 0, "reason": f"System Error: {str(e)}"}
+
+    # 5. ALWAYS SAVE DATA (Even if it fails, so we can see why on the website)
+    try:
         status_data = {
-            "action": decision['action'],
-            "confidence": decision['confidence'],
-            "reason": decision['reason'],
+            "action": decision.get('action', 'HOLD'),
+            "confidence": decision.get('confidence', 0),
+            "reason": decision.get('reason', 'Unknown error'),
             "price": current_price,
             "timestamp": time.ctime() 
         }
-        
         with open('data.json', 'w') as f:
             json.dump(status_data, f)
-        print("Dashboard data updated.")
-
-    except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
+        print("Dashboard data.json updated.")
+    except:
+        print("Failed to write data.json")
 
 if __name__ == "__main__":
     run_bot()
