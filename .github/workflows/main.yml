@@ -2,8 +2,11 @@ name: AI Crypto Bot
 
 on:
   schedule:
-    - cron: '0 * * * *'  # This runs exactly once every hour
-  workflow_dispatch:      # This gives you a manual "Run" button
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # THIS GIVES THE BOT PERMISSION TO SAVE THE HTML/JSON
 
 jobs:
   trade:
@@ -26,3 +29,11 @@ jobs:
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
         run: python bot.py
+
+      - name: Save Results to Repo
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add data.json
+          git commit -m "Update Dashboard [skip ci]" || exit 0
+          git push
