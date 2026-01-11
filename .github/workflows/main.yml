@@ -1,9 +1,43 @@
-- name: Install dependencies
-        run: pip install ccxt groq
+name: AI Crypto Bot
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # This runs automatically every hour
+  workflow_dispatch:      # This allows you to click the "Run" button manually
+
+permissions:
+  contents: write  # This allows the bot to save data.json back to your repo
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install ccxt groq
 
       - name: Run Bot
         env:
+          # This pulls your keys from the "Secrets" section we set up
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
         run: python bot.py
+
+      - name: Update Dashboard Data
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git add data.json
+          # If there are no changes, this will not error out
+          git commit -m "Update Dashboard Data [skip ci]" || exit 0
+          git push
