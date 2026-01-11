@@ -1,27 +1,7 @@
-name: AI Crypto Bot
-
-on:
-  schedule:
-    - cron: '0 * * * *'
-  workflow_dispatch:
-
-permissions:
-  contents: write  # THIS GIVES THE BOT PERMISSION TO SAVE THE HTML/JSON
-
-jobs:
-  trade:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
-
-      - name: Install Dependencies
-        run: pip install ccxt google-generativeai
+- name: Run Debug Models
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: python debug_models.py
 
       - name: Run Bot
         env:
@@ -29,11 +9,3 @@ jobs:
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
           MEXC_SECRET: ${{ secrets.MEXC_SECRET }}
         run: python bot.py
-
-      - name: Save Results to Repo
-        run: |
-          git config --global user.name "GitHub Action"
-          git config --global user.email "action@github.com"
-          git add data.json
-          git commit -m "Update Dashboard [skip ci]" || exit 0
-          git push
