@@ -7,121 +7,118 @@ import threading
 from groq import Groq
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# --- GLOBAL DATA STORAGE ---
-latest_status = {
-    "action": "Starting...",
-    "confidence": 0,
-    "reason": "Initial cycle...",
-    "price": "Loading...",
-    "news": "News key missing (CP_API_KEY)",
-    "time": ""
-}
-
-# --- 1. THE DASHBOARD SERVER ---
-class DashboardHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        
-        # Color coding for the action
-        color = "#00ff00" # Green for Buy/Hold
-        if latest_status['action'] == "SELL": color = "#ff4444"
-        
-        html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>GCR AI AGENT</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-                body {{ font-family: 'Courier New', monospace; background: #0a0a0a; color: white; padding: 20px; line-height: 1.6; }}
-                .container {{ max-width: 600px; margin: auto; border: 1px solid {color}; padding: 20px; box-shadow: 0 0 15px {color}; }}
-                h1 {{ color: {color}; text-align: center; border-bottom: 1px solid {color}; padding-bottom: 10px; }}
-                .stat {{ margin: 15px 0; font-size: 1.1em; }}
-                .label {{ color: #888; font-size: 0.8em; text-transform: uppercase; display: block; }}
-                .val {{ font-size: 1.3em; font-weight: bold; }}
-                .reason {{ color: #00d4ff; font-style: italic; background: #1a1a1a; padding: 15px; border-radius: 5px; margin-top: 20px; }}
-                small {{ color: #555; }}
-            </style>
-            <script>setTimeout(() => location.reload(), 30000);</script>
-        </head>
-        <body>
-            <div class="container">
-                <h1>GCR_AI_PRO_V2</h1>
-                <div class="stat"><span class="label">Current Action</span><span class="val" style="color:{color}">{latest_status['action']}</span></div>
-                <div class="stat"><span class="label">AI Confidence</span><span class="val">{latest_status['confidence']}%</span></div>
-                <div class="stat"><span class="label">Live BTC Price</span><span class="val">{latest_status['price']} USDT</span></div>
-                <div class="stat"><span class="label">Market Narrative</span><br><small>{latest_status['news']}</small></div>
-                <div class="reason">“{latest_status['reason']}”</div>
-                <p style="text-align:center"><small>Last Update: {latest_status['time']}</small></p>
-            </div>
-        </body>
-        </html>
-        """
-        self.wfile.write(html.encode())
-
-def run_dashboard():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), DashboardHandler)
-    server.serve_forever()
-
-# --- 2. THE IMPROVED TRADING LOGIC ---
+# --- SETUP ---
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 exchange = ccxt.mexc({'apiKey': os.getenv("MEXC_API_KEY"), 'secret': os.getenv("MEXC_SECRET")})
 
-def get_market_alpha():
-    """Separated Price and News so one failure doesn't break both"""
-    price = "Error"
-    headlines = "No news available (Add CP_API_KEY)"
+latest_status = {"action": "WATCHING", "confidence": 0, "reason": "Syncing Flow...", "price": "0", "alpha": "Scan Start", "time": ""}
 
-    # Try to get Price
+# --- 1. FREE ALPHA: THE ORDER BOOK WHALE DETECTOR ---
+def get_order_flow_alpha():
+    """Detects 'Whale Walls' on the order book for FREE"""
     try:
-        ticker = exchange.fetch_ticker('BTC/USDT')
-        price = ticker['last']
-    except Exception as e:
-        print(f"Price Fetch Error: {e}")
+        # We look at the top 50 orders on the book
+        limit = 50
+        orderbook = exchange.fetch_order_book('BTC/USDT', limit)
+        
+        # Calculate the total 'weight' of buy vs sell orders
+        # If one side is 3x larger than the other, a Whale is present
+        bids_vol = sum([bid[1] for bid in orderbook['bids']]) # Buy orders
+        asks_vol = sum([ask[1] for ask in orderbook['asks']]) # Sell orders
+        
+        if bids_vol > asks_vol * 1.5:
+            return f"WHALE SUPPORT: Buy Walls are {round(bids_vol/asks_vol, 1)}x stronger than Sell Walls."
+        elif asks_vol > bids_vol * 1.5:
+            return f"WHALE PRESSURE: Sell Walls are {round(asks_vol/bids_vol, 1)}x stronger than Buy Walls."
+        else:
+            return "Order flow is balanced. No major whale walls."
+    except:
+        return "Order Book Error"
 
-    # Try to get News
-    cp_key = os.getenv('CP_API_KEY')
-    if cp_key:
-        try:
-            news_url = f"https://cryptopanic.com/api/v1/posts/?auth_token={cp_key}&public=true"
-            res = requests.get(news_url).json()
-            headlines = " | ".join([p['title'] for p in res['results'][:3]])
-        except:
-            headlines = "News API error"
-    
-    return price, headlines
+def get_instant_news():
+    """High-speed free news feed (Seconds delay only)"""
+    cc_key = os.getenv("CRYPTOCOMPARE_KEY")
+    if not cc_key: return "News Key Missing"
+    try:
+        url = f"https://min-api.cryptocompare.com/data/v2/news/?lang=EN&api_key={cc_key}"
+        res = requests.get(url).json()
+        return " | ".join([n['title'] for n in res['Data'][:3]])
+    except:
+        return "News Feed Offline"
 
+# --- 2. THE GCR REASONING ENGINE ---
 def run_cycle():
     global latest_status
-    price, news = get_market_alpha()
-    
-    prompt = f"You are GCR. Bitcoin is {price}. Market News: {news}. Decision? JSON: {{'action': 'BUY/SELL/HOLD', 'confidence': 0-100, 'reason': '...'}}"
-    
     try:
-        chat = client.chat.completions.create(
+        # A. Perception
+        price = exchange.fetch_ticker('BTC/USDT')['last']
+        whale_intent = get_order_flow_alpha()
+        fast_news = get_instant_news()
+
+        # B. Reasoning
+        prompt = f"""
+        You are GCR. Bitcoin Price: {price} USDT.
+        ORDER FLOW ALPHA (Real-time Intent): {whale_intent}
+        LATEST NEWS HEADLINES: {fast_news}
+        
+        STRATEGY: 
+        1. If News is BULLISH but WHALE PRESSURE (Sell Walls) is high, it is a TRAP. SELL.
+        2. If News is BEARISH but WHALE SUPPORT (Buy Walls) is high, the bottom is in. BUY.
+        3. Only trade if Order Flow Divergence is clear.
+        
+        Respond ONLY in JSON: {{'action': 'BUY/SELL/HOLD', 'confidence': 0-100, 'reason': '...'}}
+        """
+        
+        completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             response_format={"type": "json_object"}
         )
-        decision = json.loads(chat.choices[0].message.content)
-        
+        decision = json.loads(completion.choices[0].message.content)
+
         latest_status = {
             "action": decision['action'],
             "confidence": decision['confidence'],
             "reason": decision['reason'],
             "price": price,
-            "news": news,
+            "alpha": whale_intent,
             "time": time.ctime()
         }
-    except Exception as e:
-        print(f"Logic Error: {e}")
+        
+        # C. Trade Execution
+        if decision['confidence'] >= 95:
+            print(f"!!! GCR ALPHA TRADE: {decision['action']} !!!")
+            # exchange.create_market_order(...)
 
-# --- 3. EXECUTION ---
+    except Exception as e:
+        print(f"Cycle Error: {e}")
+
+# --- 3. LIVE DASHBOARD ---
+class Dashboard(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        html = f"""
+        <html><body style="background:#050505;color:#00ff41;font-family:monospace;padding:40px;">
+            <div style="border:1px solid #00ff41;padding:30px;box-shadow:0 0 30px #00ff41;max-width:700px;margin:auto;">
+                <h1 style="text-align:center;">GCR_AGENT_ORDER_FLOW_V3</h1>
+                <hr style="border:0.5px solid #00ff41;">
+                <p style="font-size:1.5em;">ACTION: <span style="background:#003300;padding:5px;">{latest_status['action']}</span></p>
+                <p>CONFIDENCE: {latest_status['confidence']}%</p>
+                <p>BTC_PRICE: {latest_status['price']} USDT</p>
+                <p style="color:#00d4ff;">INTENT: {latest_status['alpha']}</p>
+                <p style="color:#ffcc00;border-left:4px solid #ffcc00;padding-left:15px;line-height:1.6;">{latest_status['reason']}</p>
+                <hr style="border:0.5px solid #00ff41;">
+                <small>LAST_TICK: {latest_status['time']}</small>
+            </div>
+            <script>setTimeout(()=>location.reload(), 10000);</script>
+        </body></html>
+        """
+        self.wfile.write(html.encode())
+
 if __name__ == "__main__":
-    threading.Thread(target=run_dashboard, daemon=True).start()
+    threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 8080))), Dashboard).serve_forever(), daemon=True).start()
     while True:
         run_cycle()
-        time.sleep(30) # High-speed refresh
+        time.sleep(10) # 10-second check for ultra-fast reaction
