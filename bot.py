@@ -15,7 +15,7 @@ SESSION_START_TIME = time.time()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 exchange = ccxt.mexc()
 
-# --- PERSISTENT STATE MANAGEMENT ---
+# --- PERSISTENT STATE ---
 STATE_FILE = "trade_state.json"
 
 def save_state(state):
@@ -30,67 +30,76 @@ def load_state():
             with open(STATE_FILE, 'r') as f:
                 return json.load(f)
         except: pass
-    return {
-        "global_start": time.time(),
-        "is_holding": False,
-        "entry_price": 0,
-        "total_trades": 0,
-        "logs": []
-    }
+    return {"global_start": time.time(), "is_holding": False, "entry_price": 0, "total_trades": 0, "logs": []}
 
 paper_trade = load_state()
-latest_status = {"action": "SCANNING", "confidence": 0, "reason": "Syncing Alpha...", "price": "0", "alpha": "Checking Book...", "pnl": 0, "time": ""}
+latest_status = {"action": "SCANNING", "confidence": 0, "reason": "Calibrating Sensors...", "price": "0", "pnl": 0, "time": ""}
 
-# --- 1. ALPHA SENSORS ---
-def get_whale_intent():
-    """MEXC Order Book Analysis (Free & Instant)"""
+# --- 1. DETERMINISTIC SIGNAL LAYER (The Sensors) ---
+
+def get_whale_regime():
+    """Calculates whale intent with a strict 1.8x noise filter"""
     try:
-        limit = 50
-        ob = exchange.fetch_order_book('BTC/USDT', limit)
-        bids_vol = sum([bid[1] for bid in ob['bids']]) # Buyers
-        asks_vol = sum([ask[1] for ask in ob['asks']]) # Sellers
+        ob = exchange.fetch_order_book('BTC/USDT', 50)
+        bids = sum([b[1] for b in ob['bids']])
+        asks = sum([a[1] for a in ob['asks']])
         
-        if bids_vol > asks_vol:
-            return f"Whale Support: {round(bids_vol/asks_vol, 1)}x"
-        else:
-            return f"Whale Pressure: {round(asks_vol/bids_vol, 1)}x"
+        ratio = bids / asks if asks > 0 else 1
+        
+        if ratio > 1.8: return "STRONG_BUY_SUPPORT"
+        if ratio < 0.55: return "STRONG_SELL_PRESSURE" # (1/1.8 = 0.55)
+        return "NEUTRAL_NOISE"
     except:
-        return "Order Book Syncing..."
+        return "SENSOR_OFFLINE"
 
-# --- 2. CORE LOGIC ---
-def add_to_log(text):
-    global paper_trade
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    log_entry = f"[{timestamp}] {text}"
-    paper_trade["logs"].insert(0, log_entry)
-    paper_trade["logs"] = paper_trade["logs"][:30] # Increased to 30
-    save_state(paper_trade)
+def get_filtered_news():
+    """Filters news specifically for BTC and Macro Impact"""
+    keywords = ["btc", "bitcoin", "fed", "etf", "sec", "inflation", "rate", "powell"]
+    try:
+        url = f"https://min-api.cryptocompare.com/data/v2/news/?lang=EN&api_key={os.getenv('CRYPTOCOMPARE_KEY')}"
+        res = requests.get(url).json()
+        
+        # Only keep headlines that mention our keywords
+        filtered = [
+            n['title'] for n in res['Data'] 
+            if any(k in n['title'].lower() for k in keywords)
+        ]
+        return " | ".join(filtered[:3]) if filtered else "No BTC-Relevant News"
+    except:
+        return "NEWS_OFFLINE"
+
+# --- 2. THE ARBITRATOR (The AI Judge) ---
 
 def run_cycle():
     global latest_status, paper_trade
     try:
-        # A. PERCEPTION
-        ticker = exchange.fetch_ticker('BTC/USDT')
-        price = ticker['last']
-        whale_alpha = get_whale_intent()
+        # A. Gather Clean Data
+        price = exchange.fetch_ticker('BTC/USDT')['last']
+        whale_state = get_whale_regime()
+        btc_news = get_filtered_news()
         
-        # B. NEWS FETCH
-        news_res = requests.get(f"https://min-api.cryptocompare.com/data/v2/news/?lang=EN&api_key={os.getenv('CRYPTOCOMPARE_KEY')}").json()
-        news_headlines = " | ".join([n['title'] for n in news_res['Data'][:2]])
-        
-        # C. CALC P/L
-        current_pnl = 0
-        if paper_trade["is_holding"]:
-            current_pnl = round(((price - paper_trade["entry_price"]) / paper_trade["entry_price"]) * 100, 2)
+        # B. Calculate P/L
+        current_pnl = round(((price - paper_trade["entry_price"]) / paper_trade["entry_price"]) * 100, 2) if paper_trade["is_holding"] else 0
 
-        # D. REASONING
+        # C. The Judge Prompt
         prompt = f"""
-        You are GCR. Bitcoin Price: {price}. 
-        Whale Intent (Order Book): {whale_alpha}. 
-        Market News: {news_headlines}.
-        
-        TASK: Weigh the Whale Intent against the News. If News is hype but Whale Pressure is high, SELL. 
-        Respond ONLY in JSON: {{'action': 'BUY/SELL/HOLD', 'confidence': 0-100, 'reason': '...'}}
+        System: Act as GCR (Elite Arbitrator).
+        Facts:
+        - BTC Price: {price} USDT
+        - Whale Intent: {whale_state}
+        - Relevant News: {btc_news}
+
+        Decision Guidelines:
+        - ACTION: BUY, SELL, or HOLD.
+        - CONFIDENCE: 0-100. (Use 90+ ONLY if Whale Intent and News are perfectly aligned).
+        - REASON: Focus on Divergence (e.g., News is hype but Whale is STRONG_SELL_PRESSURE).
+
+        Respond ONLY in valid JSON:
+        {{
+          "action": "BUY",
+          "confidence": 85,
+          "reason": "..."
+        }}
         """
         
         chat = client.chat.completions.create(
@@ -100,34 +109,25 @@ def run_cycle():
         )
         decision = json.loads(chat.choices[0].message.content)
 
-        # E. LOGGING (Include Whale Alpha in history)
-        log_msg = f"{whale_alpha} | AI ({decision['confidence']}%): {decision['reason']}"
-        add_to_log(log_msg)
-
-        # F. PAPER TRADE EXECUTION
-        if decision['confidence'] >= 95:
+        # D. Logging
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_msg = f"[{timestamp}] [{whale_state}] AI ({decision['confidence']}%): {decision['reason']}"
+        paper_trade["logs"].insert(0, log_msg)
+        paper_trade["logs"] = paper_trade["logs"][:30]
+        
+        # E. Logic Execution (Threshold lowered to 90% per advice)
+        if decision['confidence'] >= 90:
             if decision['action'] == "BUY" and not paper_trade["is_holding"]:
                 paper_trade["is_holding"] = True
                 paper_trade["entry_price"] = price
                 paper_trade["total_trades"] += 1
-                add_to_log(f"!!! TRIGGER BUY at {price}")
             elif decision['action'] == "SELL" and paper_trade["is_holding"]:
-                final_p = round(((price - paper_trade["entry_price"]) / paper_trade["entry_price"]) * 100, 2)
-                add_to_log(f"!!! TRIGGER SELL at {price} | Final P/L: {final_p}%")
                 paper_trade["is_holding"] = False
                 paper_trade["entry_price"] = 0
         
         save_state(paper_trade)
+        latest_status = {"action": decision['action'], "confidence": decision['confidence'], "reason": decision['reason'], "price": price, "alpha": whale_state, "pnl": current_pnl, "time": time.ctime()}
 
-        latest_status = {
-            "action": decision['action'], 
-            "confidence": decision['confidence'], 
-            "reason": decision['reason'], 
-            "price": price, 
-            "alpha": whale_alpha,
-            "pnl": current_pnl,
-            "time": time.ctime()
-        }
     except Exception as e:
         print(f"Cycle Error: {e}")
 
@@ -138,56 +138,41 @@ class Dashboard(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/html")
         self.end_headers()
         
-        def format_time(seconds):
-            d, rem = divmod(int(seconds), 86400)
-            h, rem = divmod(rem, 3600)
-            m, _ = divmod(rem, 60)
-            return f"{d}d {h}h {m}m"
-
-        session_uptime = format_time(time.time() - SESSION_START_TIME)
-        global_age = format_time(time.time() - paper_trade["global_start"])
         pnl_color = "#00ff41" if latest_status.get('pnl', 0) >= 0 else "#ff4444"
         log_text = "\n".join(paper_trade["logs"])
+        
+        uptime = f"{int((time.time() - SESSION_START_TIME)/60)}m"
 
         html = f"""
-        <html><head><title>GCR_QUANT_CORE</title>
+        <html><head><title>GCR_REGIME_V5</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body {{ background:#000; color:#00ff41; font-family:monospace; padding:15px; }}
             .container {{ border:1px solid #00ff41; padding:20px; box-shadow:0 0 15px #00ff41; max-width:650px; margin:auto; }}
-            .header {{ display:flex; justify-content:space-between; font-size:0.7em; color:#444; margin-bottom:10px; }}
-            .main-stat {{ background:#0a0a0a; padding:15px; border:1px solid #222; text-align:center; margin-bottom:10px; }}
-            .alpha-bar {{ color:#00d4ff; border-left:3px solid #00d4ff; padding-left:10px; margin:10px 0; font-size:0.9em; }}
+            .header {{ display:flex; justify-content:space-between; font-size:0.75em; color:#444; }}
+            .stats {{ background:#0a0a0a; border:1px solid #222; padding:20px; text-align:center; margin:15px 0; }}
             .log-box {{ background:#050505; color:#777; border:1px solid #222; padding:10px; height:250px; overflow-y:scroll; font-size:0.75em; white-space: pre-wrap; }}
-            .btn {{ background:#00ff41; color:#000; border:none; padding:8px; width:100%; cursor:pointer; font-weight:bold; margin-top:10px; }}
+            .btn {{ background:#00ff41; color:#000; border:none; padding:10px; width:100%; cursor:pointer; font-weight:bold; margin-top:10px; }}
         </style></head>
         <body>
             <div class="container">
                 <div class="header">
-                    <span>GLOBAL_AGE: {global_age}</span>
-                    <span style="color:#00ff41;">SESSION: {session_uptime}</span>
+                    <span>REGIME: {latest_status['alpha']}</span>
+                    <span>UPTIME: {uptime}</span>
                 </div>
-                
-                <div class="main-stat">
-                    <div style="font-size:3em; color:{pnl_color};">{latest_status.get('pnl', 0)}%</div>
-                    <div style="letter-spacing:4px; font-size:0.8em; color:#888;">{latest_status['action']} ({latest_status['confidence']}%)</div>
+                <div class="stats">
+                    <div style="font-size:3.5em; color:{pnl_color};">{latest_status.get('pnl', 0)}%</div>
+                    <div style="color:#888;">{latest_status['action']} ({latest_status['confidence']}%)</div>
                 </div>
-
-                <div class="alpha-bar">INTENT: {latest_status['alpha']}</div>
-                <div style="color:#ffcc00; font-size:0.9em;">> {latest_status['reason']}</div>
-
-                <div style="margin-top:20px;">
-                    <span style="font-size:0.7em; color:#333;">RAW_ALPHA_LOG:</span>
-                    <div class="log-box" id="logBox">{log_text}</div>
-                    <button class="btn" onclick="copyLogs()">COPY ALL LOGS</button>
-                </div>
-                <div style="text-align:center; font-size:0.6em; margin-top:10px; color:#222;">PRICE: {latest_status['price']} USDT</div>
+                <div style="color:#ffcc00; font-size:0.9em; margin-bottom:15px;">> {latest_status['reason']}</div>
+                <div class="log-box" id="logBox">{log_text}</div>
+                <button class="btn" onclick="copyLogs()">COPY ARCHIVE</button>
             </div>
             <script>
                 function copyLogs() {{
                     const text = document.getElementById('logBox').innerText;
                     navigator.clipboard.writeText(text);
-                    alert('Quant Logs Copied');
+                    alert('Archive Copied');
                 }}
                 setTimeout(()=>location.reload(), 15000);
             </script>
