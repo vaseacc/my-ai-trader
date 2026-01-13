@@ -7,12 +7,12 @@ from datetime import datetime
 SESSION_START_TIME = time.time()
 CONFIG = {
     "WINDOW_SIZE": 20,         
-    "PHYSICS_CONFIDENCE": 90,  
+    "PHYSICS_CONFIDENCE": 90,  # LOWERED: Now trades more aggressively
     "NEWS_COOLDOWN": 600       
 }
 
 # --- PERSISTENT STATE ---
-STATE_FILE = "trade_state_v11_learning.json"
+STATE_FILE = "trade_state_v11_aggressive.json"
 
 def save_state(s):
     try:
@@ -33,8 +33,8 @@ def load_state():
         "market_phase": "STABLE",
         "cached_news": "No News Cached",
         "last_news_time": 0,
-        "important_logs": [], # For Buys/Sells
-        "activity_stream": [], # For every cycle observation
+        "important_logs": [],
+        "activity_stream": [],
         "history": []
     }
 
@@ -42,7 +42,7 @@ state = load_state()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 exchange = ccxt.mexc()
 
-# --- 1. SENSORS (Whale Depth & Energy) ---
+# --- 1. SENSORS ---
 
 class MarketPhysics:
     @staticmethod
@@ -66,7 +66,7 @@ def get_macro_news():
         return state["cached_news"]
     keywords = ["btc", "bitcoin", "fed", "rate", "etf", "sec", "inflation", "powell"]
     try:
-        url = f"https://min-api.cryptocompare.com/data/v2/news/?lang=EN&api_key={os.getenv('CRYPTOCOMPARE_KEY')}"
+        url = f"https://min-api.cryptocompare.com/data/v2/news/?api_key={os.getenv('CRYPTOCOMPARE_KEY')}"
         res = requests.get(url).json()
         filtered = [n['title'] for n in res['Data'] if any(k in n['title'].lower() for k in keywords)]
         state["cached_news"] = " | ".join(filtered[:3]) if filtered else "NO_MACRO_CATALYST"
@@ -87,7 +87,7 @@ def add_to_activity_stream(text):
     global state
     ts = datetime.now().strftime("%H:%M:%S")
     state["activity_stream"].insert(0, f"[{ts}] {text}")
-    state["activity_stream"] = state["activity_stream"][:50] # Keep last 50 cycles
+    state["activity_stream"] = state["activity_stream"][:60]
     save_state(state)
 
 def run_cycle():
@@ -111,69 +111,78 @@ def run_cycle():
         ai = json.loads(chat.choices[0].message.content)
         state['market_phase'] = ai['phase']
 
-        # LOG EVERY CYCLE TO THE ACTIVITY STREAM
-        activity_msg = f"FLOW: {imbalance}x | ENERGY: {energy}% | {ai['phase']} | {ai['logic'][:50]}..."
+        # LOG CYCLE
+        activity_msg = f"FLOW: {imbalance}x | ENERGY: {energy}% | {ai['phase']} | {ai['logic'][:60]}"
         add_to_activity_stream(activity_msg)
 
-        # EXECUTION
+        # EXECUTION (Triggered at 90% confidence)
         if not state['is_holding'] and energy > 80 and ai['conviction'] >= CONFIG["PHYSICS_CONFIDENCE"]:
             if ai['trapped_side'] != "NONE":
                 state.update({"is_holding": True, "entry_price": price, "entry_time": datetime.now().strftime("%b %d, %H:%M")})
-                add_to_important_log(f"🚀 FORCED {ai['trapped_side']} UNWIND at {price}")
+                add_to_important_log(f"🚀 BUY: {price} | {ai['logic']}")
 
         if state['is_holding'] and (pnl < -1.5 or pnl > 3.5):
-            add_to_important_log(f"💰 EXIT at {price} | P/L: {pnl}%")
+            add_to_important_log(f"💰 EXIT: {price} | P/L: {pnl}%")
             state.update({"is_holding": False, "entry_price": 0})
 
         save_state(state)
     except Exception as e: print(f"Cycle Error: {e}")
 
-# --- 3. THE "LEARNING" DASHBOARD ---
+# --- 3. THE DASHBOARD ---
 
 class Dashboard(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.send_header("Content-type", "text/html"); self.end_headers()
-        
         energy = MarketPhysics.get_energy_score(state['price_history'])
         ticker = exchange.fetch_ticker('BTC/USDT')
         pnl = round(((ticker['last'] - state['entry_price']) / state['entry_price']) * 100, 2) if state['is_holding'] else 0
         
-        uptime = f"{int((time.time() - SESSION_START_TIME)/60)}m"
-        age = f"{int((time.time() - state['global_start'])/86400)}d"
-
         html = f"""
-        <html><head><title>GCR_V11_LEARNING</title>
+        <html><head><title>GCR_V11_AGGRESSIVE</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body {{ background:#050505; color:#0f0; font-family:monospace; padding:15px; line-height:1.4; }}
             .container {{ border:1px solid #0f0; padding:20px; box-shadow:0 0 15px #0f0; max-width:700px; margin:auto; }}
-            .header {{ display:flex; justify-content:space-between; font-size:0.7em; color:#444; }}
-            .energy-bar {{ height:15px; background:#111; border:1px solid #333; margin:15px 0; }}
-            .energy-fill {{ height:100%; background:#0f0; width:{energy}%; transition: width 0.5s; }}
             .pnl {{ font-size:3em; text-align:center; color:{'#0f0' if pnl >=0 else '#f00'}; }}
-            .section-label {{ font-size:0.7em; color:#00d4ff; margin-top:20px; text-transform:uppercase; border-bottom:1px solid #222; }}
-            .scroll-box {{ font-size:0.7em; color:#666; height:150px; overflow:scroll; background:#000; padding:10px; border:1px solid #111; margin-top:5px; }}
-            .important {{ color: #0f0; border-color: #0f0; height: 100px; }}
+            .scroll-box {{ font-size:0.7em; color:#666; height:180px; overflow:scroll; background:#000; padding:10px; border:1px solid #111; margin-top:5px; white-space: pre-wrap; }}
+            .btn {{ background:#0f0; color:#000; border:none; padding:10px; width:100%; cursor:pointer; font-weight:bold; margin-top:10px; }}
+            .label {{ font-size:0.7em; color:#00d4ff; margin-top:20px; text-transform:uppercase; border-bottom:1px solid #222; }}
         </style></head>
         <body>
             <div class="container">
-                <div class="header">
-                    <span>PROJECT_AGE: {age}</span>
-                    <span style="color:#0f0;">SESSION_UPTIME: {uptime}</span>
+                <div style="display:flex; justify-content:space-between; font-size:0.7em; color:#444;">
+                    <span>AGE: {int((time.time()-state['global_start'])/86400)}d</span>
+                    <span>CONFIDENCE: {CONFIG['PHYSICS_CONFIDENCE']}%</span>
                 </div>
                 
-                <div class="energy-bar"><div class="energy-fill"></div></div>
                 <div class="pnl">{pnl}%</div>
+                <div style="text-align:center; color:#555; font-size:0.8em;">{ 'HOLDING POSITION' if state['is_holding'] else 'SCANNING FOR BREAKOUT' }</div>
 
-                <div class="section-label">Important Events (Trades)</div>
-                <div class="scroll-box important">{ "\n".join(state["important_logs"]) if state["important_logs"] else "No trades yet." }</div>
+                <button class="btn" onclick="copyFullLog()">📋 COPY FULL SYSTEM LOG</button>
 
-                <div class="section-label">Live Market Activity Stream (Learning)</div>
-                <div class="scroll-box">{ "\n".join(state["activity_stream"]) }</div>
+                <div class="label">Trade Events</div>
+                <div class="scroll-box" id="importantBox">{ "\n".join(state["important_logs"]) }</div>
 
-                <div style="text-align:center; font-size:0.6em; color:#222; margin-top:15px;">PATH: { "UP" if MarketPhysics.get_weighted_imbalance(exchange.fetch_order_book('BTC/USDT', 50)) > 1 else "DOWN"} | BTC: {ticker['last']}</div>
+                <div class="label">Activity Stream</div>
+                <div class="scroll-box" id="activityBox">{ "\n".join(state["activity_stream"]) }</div>
             </div>
-            <script>setTimeout(()=>location.reload(), 15000);</script>
+
+            <script>
+                function copyFullLog() {{
+                    const important = document.getElementById('importantBox').innerText;
+                    const activity = document.getElementById('activityBox').innerText;
+                    const fullLog = "--- TRADE EVENTS ---\\n" + important + "\\n\\n--- ACTIVITY STREAM ---\\n" + activity;
+                    
+                    const el = document.createElement('textarea');
+                    el.value = fullLog;
+                    document.body.appendChild(el);
+                    el.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(el);
+                    alert('Full system logs copied to clipboard!');
+                }}
+                setTimeout(()=>location.reload(), 20000);
+            </script>
         </body></html>
         """
         self.wfile.write(html.encode())
