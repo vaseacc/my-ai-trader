@@ -3,56 +3,36 @@ from groq import Groq
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 
-# --- V7 FINAL GLOBALS ---
-SESSION_START = time.time()
-MAX_POSITION_MINUTES = 240
-MAX_TRADES_PER_DAY = 1
-MIN_STATE_STABILITY = 3
-AI_COOLDOWN = 120
-NEWS_COOLDOWN = 600
-
-# --- ALLOWED AI STATES (CRITICAL FIX) ---
-ALLOWED_STATES = {
-    "ACCUMULATION",
-    "DISTRIBUTION",
-    "NEUTRAL_NOISE",
-    "BREAKOUT_RISK"
+# --- V9 PRO CONFIG ---
+CONFIG = {
+    "MAX_DAILY_LOSS_PCT": -5.0,
+    "MAX_TRADES_PER_DAY": 3,
+    "MIN_CONFIDENCE": 85,
+    "POSITION_BASE_USDT": 10, 
+    "STATE_STABILITY_THRESHOLD": 3
 }
 
-# --- PERSISTENT STATE ---
-STATE_FILE = "trade_state_v7_final.json"
-
-def save_state(state):
+# --- PERSISTENT LEDGER ---
+STATE_FILE = "v9_wintermute_state.json"
+def save_state(s):
     try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f)
-    except:
-        pass
+        with open(STATE_FILE, 'w') as f: json.dump(s, f)
+    except: pass
 
 def load_state():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
+            with open(STATE_FILE, 'r') as f: return json.load(f)
+        except: pass
     return {
         "global_start": time.time(),
         "is_holding": False,
         "entry_price": 0,
         "entry_time": 0,
-        "daily_trade_count": 0,
-        "last_trade_date": "",
-        "prev_market_state": "NEUTRAL_NOISE",
-        "state_counter": 0,
-        "cached_ai": {
-            "market_state": "NEUTRAL_NOISE",
-            "news_bias": "IGNORE",
-            "reason": "Initializing..."
-        },
-        "last_ai_time": 0,
-        "last_news_time": 0,
-        "cached_news": "No news yet.",
+        "trades_today": 0,
+        "last_date": "",
+        "current_regime": "NEUTRAL",
+        "regime_counter": 0,
         "logs": [],
         "history": []
     }
@@ -61,210 +41,162 @@ state = load_state()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 exchange = ccxt.mexc()
 
-# --- 1. DECOUPLED SENSORS ---
+# --- 1. SPECIALIZED AGENTS ---
 
-def get_whale_regime():
-    try:
+class MarketAgent:
+    @staticmethod
+    def get_context():
+        ticker = exchange.fetch_ticker('BTC/USDT')
         ob = exchange.fetch_order_book('BTC/USDT', 50)
-        bids = sum(x[1] for x in ob['bids'])
-        asks = sum(x[1] for x in ob['asks'])
+        bids = sum([x[1] for x in ob['bids']]); asks = sum([x[1] for x in ob['asks']])
         ratio = bids / asks if asks > 0 else 1
-        if ratio > 1.8:
-            return "STRONG_BUY_SUPPORT"
-        if ratio < 0.55:
-            return "STRONG_SELL_PRESSURE"
-        return "NEUTRAL_NOISE"
-    except:
-        return "NEUTRAL_NOISE"
+        
+        volatility = abs(ticker['percentage'] or 0)
+        whale_state = "BULLISH_SUPPORT" if ratio > 1.8 else ("BEARISH_PRESSURE" if ratio < 0.55 else "NEUTRAL")
+        
+        return {
+            "price": ticker['last'],
+            "volatility": "HIGH" if volatility > 1.5 else "LOW",
+            "whale_ratio": round(ratio, 2),
+            "whale_state": whale_state
+        }
 
-def update_macro_news():
-    if time.time() - state["last_news_time"] < NEWS_COOLDOWN:
-        return state["cached_news"]
+class NewsAgent:
+    @staticmethod
+    def get_macro():
+        keywords = ["btc", "bitcoin", "fed", "etf", "sec", "inflation", "rate", "hack", "bitwise"]
+        try:
+            url = f"https://min-api.cryptocompare.com/data/v2/news/?lang=EN&api_key={os.getenv('CRYPTOCOMPARE_KEY')}"
+            res = requests.get(url).json()
+            filtered = [n['title'] for n in res['Data'] if any(k in n['title'].lower() for k in keywords)]
+            return " | ".join(filtered[:3]) if filtered else "NO_MACRO_CATALYST"
+        except: return "NEWS_OFFLINE"
 
-    keywords = ["btc", "bitcoin", "fed", "rate", "etf", "sec", "inflation", "powell"]
-    try:
-        url = f"https://min-api.cryptocompare.com/data/v2/news/?lang=EN&api_key={os.getenv('CRYPTOCOMPARE_KEY')}"
-        res = requests.get(url).json()
-        filtered = [
-            n['title'] for n in res['Data']
-            if any(k in n['title'].lower() for k in keywords)
-        ]
-        state["cached_news"] = " | ".join(filtered[:3]) if filtered else "No major news."
-        state["last_news_time"] = time.time()
-        return state["cached_news"]
-    except:
-        return state["cached_news"]
+class RiskAgent:
+    @staticmethod
+    def calc_size(confidence, vol_state):
+        # Wintermute Rule: Smaller sizes during high volatility
+        multiplier = 0.5 if vol_state == "HIGH" else 1.0
+        return round(CONFIG["POSITION_BASE_USDT"] * (confidence / 100) * multiplier, 2)
 
-# --- 2. COMMAND CENTER ---
+# --- 2. PRO DECISION ENGINE (The Brain) ---
 
-def add_to_log(text):
-    ts = datetime.now().strftime("%H:%M:%S")
-    state["logs"].insert(0, f"[{ts}] {text}")
-    state["logs"] = state["logs"][:30]
-    save_state(state)
+def pro_decision_engine(m_data, news):
+    """Wintermute-Level Heuristics"""
+    prompt = f"""
+    System: Elite Quant Arbitrator (Wintermute/GCR Style).
+    Data: Price {m_data['price']} | Whale: {m_data['whale_state']} ({m_data['whale_ratio']}x) | News: {news}
+    
+    Heuristics:
+    - Never buy into high Whale Pressure, regardless of news.
+    - Treat news hype without Whale Support as 'Exit Liquidity' (SELL).
+    - Accumulation requires Whale Support + Compressed Volatility.
+
+    JSON Output:
+    {{
+      "regime": "ACCUMULATION / DISTRIBUTION / NOISE",
+      "bias": "BULLISH / BEARISH / NEUTRAL",
+      "confidence": 0-100,
+      "logic": "1-sentence pro reasoning"
+    }}
+    """
+    chat = client.chat.completions.create(
+        messages=[{"role":"user","content":prompt}],
+        model="llama-3.3-70b-versatile",
+        response_format={"type":"json_object"}
+    )
+    return json.loads(chat.choices[0].message.content)
+
+# --- 3. MASTER CONTROL LOOP ---
 
 def run_cycle():
+    global state
     try:
-        ticker = exchange.fetch_ticker('BTC/USDT')
-        price = ticker['last']
-        whale_state = get_whale_regime()
-        news_data = update_macro_news()
+        # A. AGENT PERCEPTION
+        market = MarketAgent.get_context()
+        news = NewsAgent.get_macro()
+        
+        # B. AI CLASSIFICATION
+        intel = pro_decision_engine(market, news)
+        
+        # C. REGIME TRACKING (Stability Check)
+        if intel['regime'] == state["current_regime"]:
+            state["regime_counter"] += 1
+        else:
+            state["current_regime"] = intel['regime']
+            state["regime_counter"] = 1
 
-        # --- AI CLASSIFICATION ---
-        if time.time() - state["last_ai_time"] > AI_COOLDOWN:
-            prompt = f"""
-You are a strict market state classifier.
-
-You MUST output valid JSON.
-You MUST choose market_state from ONLY this list:
-ACCUMULATION, DISTRIBUTION, NEUTRAL_NOISE, BREAKOUT_RISK
-
-No other words are allowed.
-
-Inputs:
-Price: {price}
-Whale Activity: {whale_state}
-News: {news_data}
-
-Output format:
-{{"market_state":"...", "news_bias":"RISK_ON | RISK_OFF | IGNORE", "reason":"short explanation"}}
-"""
-
-            chat = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                response_format={"type": "json_object"}
-            )
-
-            ai_resp = json.loads(chat.choices[0].message.content)
-            ai_state = ai_resp.get("market_state", "NEUTRAL_NOISE")
-
-            # --- HARD SAFETY ---
-            if ai_state == "NEUTRAL":
-                ai_state = "NEUTRAL_NOISE"
-
-            if ai_state not in ALLOWED_STATES:
-                ai_state = "NEUTRAL_NOISE"
-                ai_resp["reason"] = "Invalid AI label → forced NEUTRAL_NOISE"
-
-            ai_resp["market_state"] = ai_state
-
-            if ai_state == state["prev_market_state"]:
-                state["state_counter"] += 1
-            else:
-                add_to_log(f"TRANSITION: {state['prev_market_state']} -> {ai_state}")
-                state["state_counter"] = 1
-                state["prev_market_state"] = ai_state
-
-            state["cached_ai"] = ai_resp
-            state["last_ai_time"] = time.time()
-
-        m_state = state["cached_ai"]["market_state"]
-        stable = state["state_counter"] >= MIN_STATE_STABILITY
-
-        # --- DAILY RESET ---
-        today = datetime.now().strftime("%Y-%m-%d")
-        if state["last_trade_date"] != today:
-            state["daily_trade_count"] = 0
-            state["last_trade_date"] = today
-
-        # --- ENTRY LOGIC ---
-        should_buy = (
-            not state["is_holding"]
-            and m_state == "ACCUMULATION"
-            and stable
-            and whale_state == "STRONG_BUY_SUPPORT"
-            and state["cached_ai"]["news_bias"] != "RISK_OFF"
+        # D. DETERMINISTIC EXECUTION (Wintermute Rules)
+        trade_allowed = (
+            state["regime_counter"] >= CONFIG["STATE_STABILITY_THRESHOLD"] and 
+            state["trades_today"] < CONFIG["MAX_TRADES_PER_DAY"]
         )
 
-        if should_buy and state["daily_trade_count"] < MAX_TRADES_PER_DAY:
-            state.update({
-                "is_holding": True,
-                "entry_price": price,
-                "entry_time": time.time(),
-                "daily_trade_count": state["daily_trade_count"] + 1
-            })
-            add_to_log(f"🚀 BUY: {price} | {state['cached_ai']['reason']}")
+        # Logic Gate
+        if not state["is_holding"] and trade_allowed:
+            if intel['regime'] == "ACCUMULATION" and market['whale_state'] == "BULLISH_SUPPORT":
+                size = RiskAgent.calc_size(intel['confidence'], market['volatility'])
+                state.update({"is_holding":True, "entry_price":market['price'], "entry_time":time.time(), "trades_today":state['trades_today']+1})
+                add_log(f"🚀 BUY: {size} USDT at {market['price']} | REASON: {intel['logic']}")
 
-        # --- EXIT LOGIC ---
         elif state["is_holding"]:
-            mins_open = (time.time() - state["entry_time"]) / 60
-            pnl = round(((price - state["entry_price"]) / state["entry_price"]) * 100, 2)
-            exit_signal = (
-                m_state == "DISTRIBUTION"
-                or whale_state == "STRONG_SELL_PRESSURE"
-                or pnl < -2.0
-                or mins_open > MAX_POSITION_MINUTES
-            )
-
-            if exit_signal:
-                reason = "SIGNAL" if m_state == "DISTRIBUTION" else "TIME/SL"
-                add_to_log(f"💰 EXIT: {reason} | P/L: {pnl}%")
-                state["history"].insert(0, {
-                    "entry": state["entry_price"],
-                    "exit": price,
-                    "pnl": pnl,
-                    "reason": reason,
-                    "date": datetime.now().strftime("%d %b")
-                })
-                state.update({
-                    "is_holding": False,
-                    "entry_price": 0,
-                    "entry_time": 0
-                })
+            pnl = round(((market['price'] - state['entry_price']) / state['entry_price']) * 100, 2)
+            if intel['regime'] == "DISTRIBUTION" or pnl < -2.0 or pnl > 4.0:
+                add_log(f"💰 EXIT: P/L {pnl}% | Reason: {intel['regime'] if pnl > -2 else 'StopLoss'}")
+                state["history"].insert(0, {"pnl": pnl, "date": datetime.now().strftime("%d %b")})
+                state.update({"is_holding":False, "entry_price":0})
 
         save_state(state)
+    except Exception as e: print(f"V9 Error: {e}")
 
-    except Exception as e:
-        print("Cycle Error:", e)
+def add_log(txt):
+    ts = datetime.now().strftime("%H:%M")
+    state["logs"].insert(0, f"[{ts}] {txt}"); state["logs"] = state["logs"][:25]
 
-# --- 3. DASHBOARD ---
+# --- 4. TWO-TIER DASHBOARD ---
+
 class Dashboard(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-
-        ticker = exchange.fetch_ticker('BTC/USDT')
-        price = ticker['last']
-        pnl = round(((price - state['entry_price']) / state['entry_price']) * 100, 2) if state['is_holding'] else 0
-
-        whale_map = {
-            "STRONG_BUY_SUPPORT": "Whales are supporting price (Bullish)",
-            "STRONG_SELL_PRESSURE": "Whales are selling (Bearish)",
-            "NEUTRAL_NOISE": "Quiet"
-        }
-
-        market_map = {
-            "ACCUMULATION": "Smart money accumulating",
-            "DISTRIBUTION": "Selling pressure rising",
-            "BREAKOUT_RISK": "High volatility risk",
-            "NEUTRAL_NOISE": "Messy and unpredictable"
-        }
-
+        self.send_response(200); self.send_header("Content-type", "text/html"); self.end_headers()
+        m = MarketAgent.get_context()
+        pnl = round(((m['price'] - state['entry_price']) / state['entry_price']) * 100, 2) if state['is_holding'] else 0
+        
         html = f"""
-        <html><body style="background:#000;color:#00ff41;font-family:monospace;padding:20px;">
-        <h2>GCR_V7_FINAL</h2>
-        <h1>{pnl}%</h1>
-        <p>{'HOLDING BTC' if state['is_holding'] else 'WAITING FOR A+ SETUP'}</p>
-        <hr>
-        <b>Whales:</b> {whale_map[get_whale_regime()]}<br>
-        <b>Market:</b> {market_map[state['prev_market_state']]}<br>
-        <b>News:</b> {state['cached_news'][:100]}<br>
-        <hr>
-        <pre>{"\n".join(state["logs"])}</pre>
+        <html><head><title>GCR_WINTERMUTE_V9</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ background:#050505; color:#00ff41; font-family:monospace; padding:15px; }}
+            .card {{ border:1px solid #222; padding:15px; background:#0a0a0a; margin-bottom:15px; }}
+            .pro-grid {{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; font-size:0.7em; color:#444; }}
+            .big-pnl {{ font-size:3.5em; text-align:center; color:{'#00ff41' if pnl >=0 else '#ff4444'}; }}
+            .log-box {{ height:200px; overflow-y:scroll; font-size:0.7em; color:#666; background:#000; padding:10px; border:1px solid #222; }}
+        </style></head>
+        <body>
+            <div style="max-width:600px; margin:auto;">
+                <div class="pro-grid">
+                    <div>WHALE: {m['whale_ratio']}x ({m['whale_state']})</div>
+                    <div style="text-align:right;">VOLATILITY: {m['volatility']}</div>
+                </div>
+                
+                <div class="card">
+                    <div class="big-pnl">{pnl}%</div>
+                    <div style="text-align:center; color:#888;">REGIME: {state['current_regime']} ({state['regime_counter']}x)</div>
+                </div>
+
+                <div class="card" style="border-left:3px solid #00d4ff;">
+                    <b style="font-size:0.7em; color:#00d4ff;">BEGINNER_VIEW:</b><br>
+                    <span style="font-size:0.9em; color:#eee;">
+                        {"The market is quiet, bot is waiting." if state['current_regime']=="NEUTRAL" else "AI is tracking smart money movement."}
+                    </span>
+                </div>
+
+                <div class="log-box">{"\n".join(state['logs'])}</div>
+            </div>
+            <script>setTimeout(()=>location.reload(), 20000);</script>
         </body></html>
         """
         self.wfile.write(html.encode())
 
-# --- MAIN ---
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    threading.Thread(
-        target=lambda: HTTPServer(('0.0.0.0', port), Dashboard).serve_forever(),
-        daemon=True
-    ).start()
-
-    while True:
-        run_cycle()
-        time.sleep(20)
+    threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 8080))), Dashboard).serve_forever(), daemon=True).start()
+    while True: run_cycle(); time.sleep(20)
