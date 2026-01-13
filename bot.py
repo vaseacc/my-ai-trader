@@ -1,19 +1,17 @@
-import os, json, time, ccxt, requests, threading
+import os, json, time, ccxt, requests, threading, math
 from groq import Groq
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 
-# --- V9 PRO CONFIG ---
+# --- V11 PHYSICS CONFIG ---
 CONFIG = {
-    "MAX_DAILY_LOSS_PCT": -5.0,
-    "MAX_TRADES_PER_DAY": 3,
-    "MIN_CONFIDENCE": 85,
-    "POSITION_BASE_USDT": 10, 
-    "STATE_STABILITY_THRESHOLD": 3
+    "WINDOW_SIZE": 20,         # Look at last 20 price ticks
+    "ENERGY_THRESHOLD": 0.15,  # Low volatility % that triggers "High Energy"
+    "PHYSICS_CONFIDENCE": 85,  # Math-based confidence before AI confirms
 }
 
 # --- PERSISTENT LEDGER ---
-STATE_FILE = "v9_wintermute_state.json"
+STATE_FILE = "v11_physics_state.json"
 def save_state(s):
     try:
         with open(STATE_FILE, 'w') as f: json.dump(s, f)
@@ -28,11 +26,8 @@ def load_state():
         "global_start": time.time(),
         "is_holding": False,
         "entry_price": 0,
-        "entry_time": 0,
-        "trades_today": 0,
-        "last_date": "",
-        "current_regime": "NEUTRAL",
-        "regime_counter": 0,
+        "price_history": [], # To calculate rolling Standard Deviation
+        "market_phase": "STABLE",
         "logs": [],
         "history": []
     }
@@ -41,162 +36,136 @@ state = load_state()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 exchange = ccxt.mexc()
 
-# --- 1. SPECIALIZED AGENTS ---
+# --- 1. PHYSICS MODULES (The Deterministic Layer) ---
 
-class MarketAgent:
+class MarketPhysics:
     @staticmethod
-    def get_context():
-        ticker = exchange.fetch_ticker('BTC/USDT')
-        ob = exchange.fetch_order_book('BTC/USDT', 50)
-        bids = sum([x[1] for x in ob['bids']]); asks = sum([x[1] for x in ob['asks']])
-        ratio = bids / asks if asks > 0 else 1
+    def get_weighted_imbalance(ob):
+        """Multi-tier imbalance: Closer orders matter more"""
+        def get_vol(orders):
+            # Tier 1 (0-5): weight 1.0 | Tier 2 (5-20): weight 0.5 | Tier 3 (20-50): weight 0.2
+            v1 = sum([x[1] for x in orders[:5]]) * 1.0
+            v2 = sum([x[1] for x in orders[5:20]]) * 0.5
+            v3 = sum([x[1] for x in orders[20:50]]) * 0.2
+            return v1 + v2 + v3
         
-        volatility = abs(ticker['percentage'] or 0)
-        whale_state = "BULLISH_SUPPORT" if ratio > 1.8 else ("BEARISH_PRESSURE" if ratio < 0.55 else "NEUTRAL")
-        
-        return {
-            "price": ticker['last'],
-            "volatility": "HIGH" if volatility > 1.5 else "LOW",
-            "whale_ratio": round(ratio, 2),
-            "whale_state": whale_state
-        }
+        bids = get_vol(ob['bids'])
+        asks = get_vol(ob['asks'])
+        return round(bids / asks, 2) if asks > 0 else 1.0
 
-class NewsAgent:
     @staticmethod
-    def get_macro():
-        keywords = ["btc", "bitcoin", "fed", "etf", "sec", "inflation", "rate", "hack", "bitwise"]
-        try:
-            url = f"https://min-api.cryptocompare.com/data/v2/news/?lang=EN&api_key={os.getenv('CRYPTOCOMPARE_KEY')}"
-            res = requests.get(url).json()
-            filtered = [n['title'] for n in res['Data'] if any(k in n['title'].lower() for k in keywords)]
-            return " | ".join(filtered[:3]) if filtered else "NO_MACRO_CATALYST"
-        except: return "NEWS_OFFLINE"
+    def get_energy_score(prices):
+        """Calculates Energy based on Rolling Volatility (Standard Deviation)"""
+        if len(prices) < 10: return 0
+        mean = sum(prices) / len(prices)
+        variance = sum((x - mean) ** 2 for x in prices) / len(prices)
+        stdev_pct = (math.sqrt(variance) / mean) * 100
+        # Energy is high when stdev is low
+        energy = max(0, 100 - (stdev_pct * 500)) 
+        return round(min(energy, 100), 1)
 
-class RiskAgent:
-    @staticmethod
-    def calc_size(confidence, vol_state):
-        # Wintermute Rule: Smaller sizes during high volatility
-        multiplier = 0.5 if vol_state == "HIGH" else 1.0
-        return round(CONFIG["POSITION_BASE_USDT"] * (confidence / 100) * multiplier, 2)
-
-# --- 2. PRO DECISION ENGINE (The Brain) ---
-
-def pro_decision_engine(m_data, news):
-    """Wintermute-Level Heuristics"""
-    prompt = f"""
-    System: Elite Quant Arbitrator (Wintermute/GCR Style).
-    Data: Price {m_data['price']} | Whale: {m_data['whale_state']} ({m_data['whale_ratio']}x) | News: {news}
-    
-    Heuristics:
-    - Never buy into high Whale Pressure, regardless of news.
-    - Treat news hype without Whale Support as 'Exit Liquidity' (SELL).
-    - Accumulation requires Whale Support + Compressed Volatility.
-
-    JSON Output:
-    {{
-      "regime": "ACCUMULATION / DISTRIBUTION / NOISE",
-      "bias": "BULLISH / BEARISH / NEUTRAL",
-      "confidence": 0-100,
-      "logic": "1-sentence pro reasoning"
-    }}
-    """
-    chat = client.chat.completions.create(
-        messages=[{"role":"user","content":prompt}],
-        model="llama-3.3-70b-versatile",
-        response_format={"type":"json_object"}
-    )
-    return json.loads(chat.choices[0].message.content)
-
-# --- 3. MASTER CONTROL LOOP ---
+# --- 2. THE COMMAND CENTER ---
 
 def run_cycle():
     global state
     try:
-        # A. AGENT PERCEPTION
-        market = MarketAgent.get_context()
-        news = NewsAgent.get_macro()
+        # A. PERCEPTION
+        ticker = exchange.fetch_ticker('BTC/USDT')
+        price = ticker['last']
+        ob = exchange.fetch_order_book('BTC/USDT', 50)
         
-        # B. AI CLASSIFICATION
-        intel = pro_decision_engine(market, news)
+        # B. UPDATE PHYSICS HISTORY
+        state['price_history'].append(price)
+        if len(state['price_history']) > CONFIG["WINDOW_SIZE"]:
+            state['price_history'].pop(0)
+            
+        # C. COMPUTE DETERMINISTIC PHYSICS
+        imbalance = MarketPhysics.get_weighted_imbalance(ob)
+        energy_score = MarketPhysics.get_energy_score(state['price_history'])
         
-        # C. REGIME TRACKING (Stability Check)
-        if intel['regime'] == state["current_regime"]:
-            state["regime_counter"] += 1
-        else:
-            state["current_regime"] = intel['regime']
-            state["regime_counter"] = 1
+        trapped_side = "NONE"
+        if imbalance > 2.0: trapped_side = "SHORTS"
+        if imbalance < 0.5: trapped_side = "LONGS"
 
-        # D. DETERMINISTIC EXECUTION (Wintermute Rules)
-        trade_allowed = (
-            state["regime_counter"] >= CONFIG["STATE_STABILITY_THRESHOLD"] and 
-            state["trades_today"] < CONFIG["MAX_TRADES_PER_DAY"]
-        )
+        # D. AI EXPLANATION ENGINE
+        # We only call AI if Energy > 50 or if we are holding
+        if energy_score > 50 or state['is_holding']:
+            prompt = f"""
+            System: Market Physics Arbitrator. 
+            Facts: Price {price} | Imbalance {imbalance}x | Energy {energy_score}% | Trapped: {trapped_side}
+            Task: Identify the Forced Unwind path.
+            JSON: {{"phase": "...", "logic": "Explain the mechanical inevitability", "conviction": 0-100}}
+            """
+            chat = client.chat.completions.create(
+                messages=[{"role":"user","content":prompt}],
+                model="llama-3.3-70b-versatile",
+                response_format={"type":"json_object"}
+            )
+            ai = json.loads(chat.choices[0].message.content)
+            state['market_phase'] = ai['phase']
+            
+            # E. EXECUTION (Math + AI Alignment)
+            if not state['is_holding'] and energy_score > 80 and trapped_side != "NONE":
+                if ai['conviction'] >= 90:
+                    state.update({"is_holding":True, "entry_price":price, "entry_time":time.time()})
+                    add_log(f"🚀 FORCED {trapped_side} UNWIND at {price} | {ai['logic']}")
 
-        # Logic Gate
-        if not state["is_holding"] and trade_allowed:
-            if intel['regime'] == "ACCUMULATION" and market['whale_state'] == "BULLISH_SUPPORT":
-                size = RiskAgent.calc_size(intel['confidence'], market['volatility'])
-                state.update({"is_holding":True, "entry_price":market['price'], "entry_time":time.time(), "trades_today":state['trades_today']+1})
-                add_log(f"🚀 BUY: {size} USDT at {market['price']} | REASON: {intel['logic']}")
-
-        elif state["is_holding"]:
-            pnl = round(((market['price'] - state['entry_price']) / state['entry_price']) * 100, 2)
-            if intel['regime'] == "DISTRIBUTION" or pnl < -2.0 or pnl > 4.0:
-                add_log(f"💰 EXIT: P/L {pnl}% | Reason: {intel['regime'] if pnl > -2 else 'StopLoss'}")
-                state["history"].insert(0, {"pnl": pnl, "date": datetime.now().strftime("%d %b")})
+        elif state['is_holding']:
+            pnl = round(((price - state['entry_price']) / state['entry_price']) * 100, 2)
+            if pnl < -1.5 or pnl > 3.5: # Hard Physics Exit
+                add_log(f"💰 RESOLVED: P/L {pnl}%")
                 state.update({"is_holding":False, "entry_price":0})
 
         save_state(state)
-    except Exception as e: print(f"V9 Error: {e}")
+        
+    except Exception as e: print(f"V11 Error: {e}")
 
 def add_log(txt):
     ts = datetime.now().strftime("%H:%M")
     state["logs"].insert(0, f"[{ts}] {txt}"); state["logs"] = state["logs"][:25]
 
-# --- 4. TWO-TIER DASHBOARD ---
+# --- 3. PHYSICS DASHBOARD ---
 
 class Dashboard(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.send_header("Content-type", "text/html"); self.end_headers()
-        m = MarketAgent.get_context()
-        pnl = round(((m['price'] - state['entry_price']) / state['entry_price']) * 100, 2) if state['is_holding'] else 0
+        ticker = exchange.fetch_ticker('BTC/USDT')
+        energy = MarketPhysics.get_energy_score(state['price_history'])
+        pnl = round(((ticker['last'] - state['entry_price']) / state['entry_price']) * 100, 2) if state['is_holding'] else 0
         
         html = f"""
-        <html><head><title>GCR_WINTERMUTE_V9</title>
+        <html><head><title>GCR_V11_PHYSICS</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body {{ background:#050505; color:#00ff41; font-family:monospace; padding:15px; }}
-            .card {{ border:1px solid #222; padding:15px; background:#0a0a0a; margin-bottom:15px; }}
-            .pro-grid {{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; font-size:0.7em; color:#444; }}
-            .big-pnl {{ font-size:3.5em; text-align:center; color:{'#00ff41' if pnl >=0 else '#ff4444'}; }}
-            .log-box {{ height:200px; overflow-y:scroll; font-size:0.7em; color:#666; background:#000; padding:10px; border:1px solid #222; }}
+            body {{ background:#000; color:#0f0; font-family:monospace; padding:15px; }}
+            .container {{ border:1px solid #0f0; padding:20px; box-shadow:0 0 15px #0f0; max-width:600px; margin:auto; }}
+            .gauge-container {{ height:20px; background:#111; border:1px solid #333; margin:10px 0; }}
+            .gauge-fill {{ height:100%; background:#0f0; width:{energy}%; transition: width 0.5s; }}
+            .pnl {{ font-size:3.5em; text-align:center; color:{'#0f0' if pnl >=0 else '#f00'}; }}
+            .log {{ font-size:0.7em; color:#555; height:180px; overflow:scroll; border-top:1px solid #222; padding-top:10px; }}
         </style></head>
         <body>
-            <div style="max-width:600px; margin:auto;">
-                <div class="pro-grid">
-                    <div>WHALE: {m['whale_ratio']}x ({m['whale_state']})</div>
-                    <div style="text-align:right;">VOLATILITY: {m['volatility']}</div>
+            <div class="container">
+                <div style="display:flex; justify-content:space-between; font-size:0.8em;">
+                    <span>PHASE: {state['market_phase']}</span>
+                    <span>ENERGY: {energy}%</span>
+                </div>
+                <div class="gauge-container"><div class="gauge-fill"></div></div>
+                
+                <div class="pnl">{pnl}%</div>
+                
+                <div style="font-size:0.8em; color:#888; margin-bottom:10px;">
+                    PATH_OF_LEAST_RESISTANCE: { "UP" if MarketPhysics.get_weighted_imbalance(exchange.fetch_order_book('BTC/USDT', 50)) > 1 else "DOWN"}
                 </div>
                 
-                <div class="card">
-                    <div class="big-pnl">{pnl}%</div>
-                    <div style="text-align:center; color:#888;">REGIME: {state['current_regime']} ({state['regime_counter']}x)</div>
-                </div>
-
-                <div class="card" style="border-left:3px solid #00d4ff;">
-                    <b style="font-size:0.7em; color:#00d4ff;">BEGINNER_VIEW:</b><br>
-                    <span style="font-size:0.9em; color:#eee;">
-                        {"The market is quiet, bot is waiting." if state['current_regime']=="NEUTRAL" else "AI is tracking smart money movement."}
-                    </span>
-                </div>
-
-                <div class="log-box">{"\n".join(state['logs'])}</div>
+                <div class="log">{"\n".join(state['logs'])}</div>
             </div>
-            <script>setTimeout(()=>location.reload(), 20000);</script>
+            <script>setTimeout(()=>location.reload(), 15000);</script>
         </body></html>
         """
         self.wfile.write(html.encode())
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 8080))), Dashboard).serve_forever(), daemon=True).start()
-    while True: run_cycle(); time.sleep(20)
+    port = int(os.environ.get("PORT", 8080))
+    threading.Thread(target=lambda: HTTPServer(('0.0.0.0', port), Dashboard).serve_forever(), daemon=True).start()
+    while True: run_cycle(); time.sleep(15)
