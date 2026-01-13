@@ -1,15 +1,15 @@
 import os, json, time, ccxt, requests, threading
 from groq import Groq
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- V7 GLOBALS ---
+# --- V7 PRO GLOBALS ---
 SESSION_START = time.time()
 MAX_POSITION_MINUTES = 240
 MAX_TRADES_PER_DAY = 1
 
 # --- PERSISTENT STATE ---
-STATE_FILE = "trade_state_v7.json"
+STATE_FILE = "trade_state_v7_pro.json"
 
 def save_state(state):
     try:
@@ -39,7 +39,7 @@ state = load_state()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 exchange = ccxt.mexc()
 
-# --- 1. THE DETERMINISTIC SENSORS ---
+# --- 1. DETERMINISTIC SENSORS ---
 
 def get_vol_regime(ticker):
     pct = abs(ticker['percentage'] or 0)
@@ -72,7 +72,7 @@ def add_to_log(text):
     global state
     ts = datetime.now().strftime("%H:%M:%S")
     state["logs"].insert(0, f"[{ts}] {text}")
-    state["logs"] = state["logs"][:30]
+    state["logs"] = state["logs"][:35] # Increased for more detail
     save_state(state)
 
 def run_cycle():
@@ -87,21 +87,19 @@ def run_cycle():
 
         # B. AI CLASSIFICATION (The Judge)
         prompt = f"""
-        System: GCR Market Classifier.
-        Price: {price} | Vol: {vol_state} | Whale: {whale_state} | News: {news_data}
-        Task: Classify Market State.
+        System: Market Classifier. Price: {price} | Vol: {vol_state} | Whale: {whale_state} | News: {news_data}
+        Task: Output Market State.
         JSON format:
         {{
             "market_state": "ACCUMULATION / DISTRIBUTION / NEUTRAL_NOISE / BREAKOUT_RISK",
             "news_bias": "RISK_ON / RISK_OFF / IGNORE",
-            "conviction": "LOW / MEDIUM / HIGH",
             "reason": "..."
         }}
         """
         chat = client.chat.completions.create(messages=[{"role":"user","content":prompt}], model="llama-3.3-70b-versatile", response_format={"type":"json_object"})
         ai = json.loads(chat.choices[0].message.content)
 
-        # C. DETERMINISTIC RULES (The Commander)
+        # C. LOGIC SETUP
         current_state = ai['market_state']
         news_bias = ai['news_bias']
         today = datetime.now().strftime("%Y-%m-%d")
@@ -111,41 +109,66 @@ def run_cycle():
             state["daily_trade_count"] = 0
             state["last_trade_date"] = today
 
-        # REGIME CHECK: Only trade State Transitions or High Conviction
-        should_buy = (current_state == "ACCUMULATION" and whale_state == "STRONG_BUY_SUPPORT" and news_bias != "RISK_OFF")
-        should_sell = (current_state == "DISTRIBUTION" and whale_state == "STRONG_SELL_PRESSURE") or state["is_holding"]
+        # --- D. DETERMINISTIC RULES (FIXED) ---
 
-        # D. EXECUTION LOGIC
+        # 1. LOG STATE TRANSITIONS
+        if current_state != state["prev_market_state"]:
+            add_to_log(f"STATE CHANGE: {state['prev_market_state']} -> {current_state}")
+
+        # 2. EVALUATE BUY (The A+ Setup)
+        should_buy = (
+            current_state == "ACCUMULATION" and 
+            state["prev_market_state"] != "ACCUMULATION" and
+            whale_state == "STRONG_BUY_SUPPORT" and
+            vol_state == "COMPRESSION"
+        )
+
+        # 3. EVALUATE VETOES
+        if should_buy:
+            if news_bias == "RISK_OFF":
+                add_to_log("VETO: Buying blocked by Macro RISK_OFF.")
+                should_buy = False
+            if current_state == "BREAKOUT_RISK":
+                add_to_log("VETO: Breakout risk detected. Chasing avoided.")
+                should_buy = False
+
+        # 4. EXECUTION
         if not state["is_holding"] and should_buy:
             if state["daily_trade_count"] < MAX_TRADES_PER_DAY:
-                if ai['conviction'] == "HIGH":
-                    state.update({"is_holding":True, "entry_price":price, "entry_time":time.time(), "daily_trade_count":state["daily_trade_count"]+1})
-                    add_to_log(f"🚀 BUY: {current_price} | REASON: {ai['reason']}")
-                else: add_to_log(f"SKIP: Conviction {ai['conviction']} too low.")
-            else: add_to_log("SKIP: Max daily trades reached.")
+                state.update({"is_holding":True, "entry_price":price, "entry_time":time.time(), "daily_trade_count":state["daily_trade_count"]+1})
+                add_to_log(f"🚀 PAPER BUY: {price} | SETUP: A+ Alignment")
+            else:
+                add_to_log("SKIP: Signal valid but Daily Trade Limit hit.")
         
-        # EXIT LOGIC (TP/SL or Time-based)
+        # 5. EXIT LOGIC (FIXED)
         elif state["is_holding"]:
-            # Forced Time Exit (240 mins)
             mins_open = (time.time() - state["entry_time"]) / 60
-            pnl = ((price - state["entry_price"]) / state["entry_price"]) * 100
+            pnl = round(((price - state["entry_price"]) / state["entry_price"]) * 100, 2)
             
-            if mins_open > MAX_POSITION_MINUTES or current_state == "DISTRIBUTION" or pnl < -2.0:
-                add_to_log(f"💰 SELL: {price} | P/L: {round(pnl,2)}% | Reason: Time/Signal Exit")
-                state["history"].insert(0, f"P/L: {round(pnl,2)}% | Entry: {state['entry_price']}")
+            # Deterministic Exit Rules
+            exit_signal = (current_state == "DISTRIBUTION" or whale_state == "STRONG_SELL_PRESSURE")
+            
+            if mins_open > MAX_POSITION_MINUTES:
+                add_to_log(f"💰 EXIT: Time Limit (240m) | P/L: {pnl}%")
+                state.update({"is_holding":False, "entry_price":0, "entry_time":0})
+            elif exit_signal:
+                add_to_log(f"💰 EXIT: Market Shift ({current_state}) | P/L: {pnl}%")
+                state.update({"is_holding":False, "entry_price":0, "entry_time":0})
+            elif pnl < -2.0:
+                add_to_log(f"💰 EXIT: Stop Loss (-2%) | P/L: {pnl}%")
                 state.update({"is_holding":False, "entry_price":0, "entry_time":0})
         
+        # 6. IDLE LOGGING
         else:
-            # NEGATIVE LOGGING: Why didn't we trade?
-            if current_state == "NEUTRAL_NOISE": add_to_log("IDLE: Neutral Noise.")
-            elif whale_state == "NEUTRAL_NOISE": add_to_log(f"IDLE: Whale state {whale_state} is weak.")
+            if current_state == "NEUTRAL_NOISE" and int(time.time()) % 300 < 20: # Log noise only once every 5 mins
+                add_to_log("STATUS: Balanced (Neutral Noise).")
 
         state["prev_market_state"] = current_state
         save_state(state)
 
     except Exception as e: print(f"Cycle Error: {e}")
 
-# --- 3. V7 DASHBOARD ---
+# --- 3. DASHBOARD ---
 class Dashboard(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.send_header("Content-type", "text/html"); self.end_headers()
@@ -154,15 +177,14 @@ class Dashboard(BaseHTTPRequestHandler):
         pnl = round(((float(exchange.fetch_ticker('BTC/USDT')['last']) - state['entry_price']) / state['entry_price']) * 100, 2) if state['is_holding'] else 0
         
         html = f"""
-        <html><head><title>GCR_V7_GOVERNANCE</title>
+        <html><head><title>GCR_V7_PRO</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body {{ background:#050505; color:#00ff41; font-family:monospace; padding:15px; }}
             .container {{ border:1px solid #00ff41; padding:20px; box-shadow:0 0 15px #00ff41; max-width:650px; margin:auto; }}
             .header {{ display:flex; justify-content:space-between; font-size:0.75em; color:#444; border-bottom:1px solid #222; padding-bottom:5px; }}
-            .stats {{ background:#0a0a0a; padding:20px; text-align:center; margin:15px 0; border:1px solid #111; }}
-            .log-box {{ background:#000; color:#666; border:1px solid #222; padding:10px; height:250px; overflow-y:scroll; font-size:0.75em; white-space: pre-wrap; }}
-            .tag {{ font-size:0.7em; background:#222; padding:3px 6px; border-radius:3px; }}
+            .stats {{ background:#0a0a0a; border:1px solid #222; padding:20px; text-align:center; margin:15px 0; }}
+            .log-box {{ background:#000; color:#666; border:1px solid #222; padding:10px; height:280px; overflow-y:scroll; font-size:0.75em; white-space: pre-wrap; }}
         </style></head>
         <body>
             <div class="container">
@@ -172,11 +194,10 @@ class Dashboard(BaseHTTPRequestHandler):
                 </div>
                 <div class="stats">
                     <div style="font-size:3.5em; color:{'#00ff41' if pnl >=0 else '#ff4444'};">{pnl}%</div>
-                    <div style="margin-top:5px; font-size:0.9em; letter-spacing:2px;">{state['prev_market_state']}</div>
-                    { f"<div class='tag'>ENTRY: {state['entry_price']}</div>" if state['is_holding'] else ""}
+                    <div style="margin-top:5px; font-size:0.9em; letter-spacing:2px; color:#fff;">{state['prev_market_state']}</div>
+                    { f"<div style='font-size:0.7em; color:#888;'>ENTRY: {state['entry_price']}</div>" if state['is_holding'] else ""}
                 </div>
-                <div class="log-box">{ "\n".join(state["logs"]) }</div>
-                <div style="font-size:0.6em; color:#222; margin-top:10px; text-align:center;">GCR GOVERNANCE PROTOCOL V7.0</div>
+                <div class="log-box" id="logBox">{ "\n".join(state["logs"]) }</div>
             </div>
             <script>setTimeout(()=>location.reload(), 20000);</script>
         </body></html>
