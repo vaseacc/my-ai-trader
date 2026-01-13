@@ -7,9 +7,9 @@ from datetime import datetime
 SESSION_START = time.time()
 MAX_POSITION_MINUTES = 240
 MAX_TRADES_PER_DAY = 1
-MIN_STATE_STABILITY = 3  # Must hold state for 3 cycles before trading
-AI_COOLDOWN = 120        # Call AI every 2 minutes
-NEWS_COOLDOWN = 600      # Fetch news every 10 minutes
+MIN_STATE_STABILITY = 3
+AI_COOLDOWN = 120
+NEWS_COOLDOWN = 600
 
 # --- PERSISTENT STATE ---
 STATE_FILE = "trade_state_v7_final.json"
@@ -63,13 +63,12 @@ def update_macro_news():
     global state
     if time.time() - state["last_news_time"] < NEWS_COOLDOWN:
         return state["cached_news"]
-    
     keywords = ["btc", "bitcoin", "fed", "rate", "etf", "sec", "inflation", "powell"]
     try:
         url = f"https://min-api.cryptocompare.com/data/v2/news/?lang=EN&api_key={os.getenv('CRYPTOCOMPARE_KEY')}"
         res = requests.get(url).json()
         filtered = [n['title'] for n in res['Data'] if any(k in n['title'].lower() for k in keywords)]
-        state["cached_news"] = " | ".join(filtered[:3]) if filtered else "NO_MACRO_CATALYST"
+        state["cached_news"] = " | ".join(filtered[:3]) if filtered else "No major news."
         state["last_news_time"] = time.time()
         return state["cached_news"]
     except: return state["cached_news"]
@@ -86,19 +85,16 @@ def add_to_log(text):
 def run_cycle():
     global state
     try:
-        # A. FAST SENSORS (Every 20s)
         ticker = exchange.fetch_ticker('BTC/USDT')
         price = ticker['last']
         whale_state = get_whale_regime()
         news_data = update_macro_news()
 
-        # B. SLOW AI CLASSIFICATION (Every 2m)
         if time.time() - state["last_ai_time"] > AI_COOLDOWN:
             prompt = f"System: Classifier. Price: {price} | Whale: {whale_state} | News: {news_data}\nOutput JSON: {{\"market_state\": \"...\", \"news_bias\": \"...\", \"reason\": \"...\"}}"
             chat = client.chat.completions.create(messages=[{"role":"user","content":prompt}], model="llama-3.3-70b-versatile", response_format={"type":"json_object"})
             ai_resp = json.loads(chat.choices[0].message.content)
             
-            # --- C. STABILITY CONSTRAINT ---
             if ai_resp['market_state'] == state["prev_market_state"]:
                 state["state_counter"] += 1
             else:
@@ -109,29 +105,22 @@ def run_cycle():
             state["cached_ai"] = ai_resp
             state["last_ai_time"] = time.time()
 
-        # D. GOVERNANCE RULES
-        current_ai = state["cached_ai"]
-        m_state = current_ai['market_state']
+        m_state = state["cached_ai"]['market_state']
         stable = state["state_counter"] >= MIN_STATE_STABILITY
         
-        # Reset Daily Trades
         if state["last_trade_date"] != datetime.now().strftime("%Y-%m-%d"):
             state.update({"daily_trade_count": 0, "last_trade_date": datetime.now().strftime("%Y-%m-%d")})
 
-        # E. EXECUTION ENGINE
         should_buy = False
         if not state["is_holding"]:
-            # 1. Check for Vetoes first
             if m_state == "BREAKOUT_RISK":
-                if int(time.time()) % 300 < 25: add_to_log("VETO: Breakout risk high.")
-            # 2. Check A+ Setup
-            elif m_state == "ACCUMULATION" and stable and whale_state == "STRONG_BUY_SUPPORT" and current_ai['news_bias'] != "RISK_OFF":
+                pass 
+            elif m_state == "ACCUMULATION" and stable and whale_state == "STRONG_BUY_SUPPORT" and state["cached_ai"]['news_bias'] != "RISK_OFF":
                 should_buy = True
 
-        # F. BUY/SELL ACTIONS
         if should_buy and state["daily_trade_count"] < MAX_TRADES_PER_DAY:
             state.update({"is_holding": True, "entry_price": price, "entry_time": time.time(), "daily_trade_count": state["daily_trade_count"]+1})
-            add_to_log(f"🚀 BUY: {price} | REASON: {current_ai['reason']}")
+            add_to_log(f"🚀 BUY: {price} | REASON: {state['cached_ai']['reason']}")
 
         elif state["is_holding"]:
             mins_open = (time.time() - state["entry_time"]) / 60
@@ -145,38 +134,63 @@ def run_cycle():
                 state.update({"is_holding": False, "entry_price": 0, "entry_time": 0})
 
         save_state(state)
-
     except Exception as e: print(f"Cycle Error: {e}")
 
-# --- 3. V7 FINAL DASHBOARD ---
+# --- 3. THE DASHBOARD (WITH BEGINNER VIEW) ---
 class Dashboard(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.send_header("Content-type", "text/html"); self.end_headers()
-        pnl = round(((float(exchange.fetch_ticker('BTC/USDT')['last']) - state['entry_price']) / state['entry_price']) * 100, 2) if state['is_holding'] else 0
-        history_html = "".join([f"<div style='font-size:0.7em;color:#555;'>• {t['date']}: {t['pnl']}% ({t['reason']})</div>" for t in state["history"][:5]])
+        ticker = exchange.fetch_ticker('BTC/USDT')
+        price = ticker['last']
+        pnl = round(((price - state['entry_price']) / state['entry_price']) * 100, 2) if state['is_holding'] else 0
+        
+        # --- BEGINNER-FRIENDLY TRANSLATIONS ---
+        whale_human = "Quiet"
+        ws = get_whale_regime()
+        if ws == "STRONG_BUY_SUPPORT": whale_human = "Whales are protecting the price (Bullish)"
+        elif ws == "STRONG_SELL_PRESSURE": whale_human = "Whales are pushing the price down (Bearish)"
+        
+        state_human = "The market is messy and unpredictable"
+        ms = state['prev_market_state']
+        if ms == "ACCUMULATION": state_human = "Smart money is buying slowly (Good Sign)"
+        elif ms == "DISTRIBUTION": state_human = "Investors are selling their bags (Caution)"
+        elif ms == "BREAKOUT_RISK": state_human = "Price might jump or crash suddenly (High Risk)"
+
+        history_html = "".join([f"<div style='font-size:0.7em;color:#555;'>• {t['date']}: {t['pnl']}%</div>" for t in state["history"][:3]])
         
         html = f"""
         <html><head><title>GCR_V7_FINAL</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body {{ background:#000; color:#00ff41; font-family:monospace; padding:15px; }}
+            body {{ background:#000; color:#00ff41; font-family:monospace; padding:15px; line-height:1.4; }}
             .container {{ border:1px solid #00ff41; padding:20px; box-shadow:0 0 15px #00ff41; max-width:650px; margin:auto; }}
-            .header {{ display:flex; justify-content:space-between; font-size:0.75em; color:#444; margin-bottom:10px; }}
-            .stats {{ background:#0a0a0a; border:1px solid #222; padding:20px; text-align:center; margin:10px 0; }}
-            .log-box {{ background:#050505; color:#777; border:1px solid #222; padding:10px; height:220px; overflow-y:scroll; font-size:0.75em; white-space: pre-wrap; }}
+            .stats {{ background:#0a0a0a; border:1px solid #222; padding:20px; text-align:center; margin:15px 0; }}
+            .beginner-box {{ background:#111; border-left:4px solid #00d4ff; padding:15px; margin:15px 0; font-size:0.9em; color:#eee; }}
+            .log-box {{ background:#050505; color:#555; border:1px solid #222; padding:10px; height:180px; overflow-y:scroll; font-size:0.7em; white-space: pre-wrap; }}
         </style></head>
         <body>
             <div class="container">
-                <div class="header">
-                    <span>STATE: {state['prev_market_state']} ({state['state_counter']}x)</span>
+                <div style="display:flex; justify-content:space-between; font-size:0.7em; color:#444;">
+                    <span>GCR_V7_FINAL</span>
                     <span>TRADES: {state['daily_trade_count']}</span>
                 </div>
+
                 <div class="stats">
                     <div style="font-size:3.5em; color:{'#00ff41' if pnl >=0 else '#ff4444'};">{pnl}%</div>
-                    <div style="font-size:0.8em; color:#00d4ff;">{ 'HOLDING POSITION' if state['is_holding'] else 'SCANNING FOR A+ SETUP' }</div>
+                    <div style="font-size:0.8em; color:#00d4ff;">{ 'HOLDING BTC' if state['is_holding'] else 'WAITING FOR A+ SETUP' }</div>
                 </div>
-                <div style="font-size:0.7em; color:#333;">CLOSED_HISTORY:</div>
-                <div style="background:#0a0a0a; padding:10px; border:1px solid #111; margin-bottom:10px;">{history_html if history_html else "No trades yet."}</div>
+
+                <!-- BEGINNER FRIENDLY SUMMARY -->
+                <div class="beginner-box">
+                    <b style="color:#00d4ff; font-size:0.75em; text-transform:uppercase;">Simple Summary for Beginners:</b><br>
+                    • <b>Whale Activity:</b> {whale_human}<br>
+                    • <b>Market Mood:</b> {state_human}<br>
+                    • <b>Latest News:</b> <span style="color:#aaa;">{state['cached_news'][:80]}...</span>
+                </div>
+
+                <div style="color:#ffcc00; font-size:0.85em; margin-bottom:15px;">> {state['cached_ai']['reason']}</div>
+
+                <div style="font-size:0.7em; color:#333;">HISTORY | LOGS:</div>
                 <div class="log-box">{ "\n".join(state["logs"]) }</div>
             </div>
             <script>setTimeout(()=>location.reload(), 20000);</script>
