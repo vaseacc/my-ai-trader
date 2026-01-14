@@ -8,10 +8,10 @@ CONFIG = {
     "TICK_INTERVAL": 15,         
     "IMBALANCE_THRESHOLD": 1.8,    
     "HISTORY_WINDOW": 5,          
-    "TIME_LIMIT": 300,            
+    "TIME_LIMIT": 900,            # FIX 3: 15 minutes (was 5)
     "COOLDOWN_TIME": 60,
     "MAX_SPREAD": 0.0008,         
-    "MIN_VOLATILITY": 0.002       
+    "MIN_VOLATILITY": 0.0012       # FIX 2: 0.12% (was 0.2%)
 }
 
 # --- 2. PERSISTENT STATE ---
@@ -24,8 +24,8 @@ STATE = {
     "price_history": [],
     "last_price": 0,           
     "cooldown_until": 0,
-    "logs": [],               # Important Events (Trades)
-    "activity_stream": [],    # Deep Debug Logs (Every Cycle)
+    "logs": [],               
+    "activity_stream": [],    
     "pnl_history": []             
 }
 
@@ -39,14 +39,13 @@ def add_log(msg):
     STATE["logs"] = STATE["logs"][:30]
 
 def add_debug(msg):
-    """Logs every single calculation for debugging"""
     ts = datetime.now().strftime("%H:%M:%S")
     STATE["activity_stream"].insert(0, f"[{ts}] {msg}")
     STATE["activity_stream"] = STATE["activity_stream"][:50]
 
 def get_recent_volatility():
     prices = STATE["price_history"][-10:]
-    if len(prices) < 5: return 0.002 
+    if len(prices) < 5: return 0.0012
     return max((max(prices) - min(prices)) / min(prices), 0.001)
 
 def persistent_imbalance(direction):
@@ -60,10 +59,15 @@ def persistent_imbalance(direction):
 
 def price_confirms(direction):
     if len(STATE["price_history"]) < CONFIG["HISTORY_WINDOW"]: return False
+    # Calculate price move from start of window to now
     move = (STATE["price_history"][-1] - STATE["price_history"][0]) / STATE["price_history"][0]
     vol_buffer = get_recent_volatility() * 0.3
-    if direction == "LONG": return move > vol_buffer
-    if direction == "SHORT": return move < -vol_buffer
+    
+    if direction == "LONG": 
+        return move > vol_buffer
+    if direction == "SHORT": 
+        # FIX 5: Stronger confirmation for shorts (1.2x buffer)
+        return move < -vol_buffer * 1.2
     return False
 
 # --- 4. MASTER LOOP ---
@@ -80,21 +84,24 @@ def run_cycle():
 
         bids = sum([x[1] for x in ob['bids'][:5]]) 
         asks = sum([x[1] for x in ob['asks'][:5]]) 
-        imbalance = bids / asks if asks > 0 else 1.0
+        
+        # FIX 1: Clamp Imbalance to prevent 300x outliers
+        raw_imbalance = bids / asks if asks > 0 else 1.0
+        imbalance = min(max(raw_imbalance, 0.2), 5.0)
 
         STATE["price_history"].append(current_price)
         STATE["imbalance_history"].append(imbalance)
         if len(STATE["price_history"]) > 20: STATE["price_history"].pop(0)
         if len(STATE["imbalance_history"]) > 10: STATE["imbalance_history"].pop(0)
 
-        # --- DEBUG LOGGING ---
         vol = get_recent_volatility()
+        
+        # Activity Logging
         status = "SCANNING"
         if spread > CONFIG["MAX_SPREAD"]: status = "WIDE_SPREAD"
         elif vol < CONFIG["MIN_VOLATILITY"]: status = "LOW_VOL"
         elif time.time() < STATE["cooldown_until"]: status = "COOLDOWN"
         elif STATE["is_holding"]: status = "HOLDING"
-
         add_debug(f"P:{current_price} | I:{round(imbalance,2)}x | S:{round(spread*100,3)}% | V:{round(vol*100,2)}% | {status}")
 
         # LOGIC GATES
@@ -113,13 +120,16 @@ def run_cycle():
             pnl = (current_price - STATE["entry_price"]) / STATE["entry_price"]
             if STATE["direction"] == "SHORT": pnl = -pnl
             
-            stop_loss, take_profit = vol * 1.5, vol * 3.0
+            # FIX 4: Asymmetric and Realistic TP/SL
+            stop_loss  = max(vol * 2.0, 0.002) # Min 0.2% stop
+            take_profit = max(vol * 4.0, 0.004) # Min 0.4% target
+            
             time_elapsed = time.time() - STATE["entry_time"]
             
             exit_reason = None
             if pnl <= -stop_loss: exit_reason = "STOP LOSS"
             elif pnl >= take_profit: exit_reason = "TAKE PROFIT"
-            elif time_elapsed > CONFIG["TIME_LIMIT"]: exit_reason = "TIME EXIT"
+            elif time_elapsed > CONFIG["TIME_LIMIT"]: exit_reason = "TIME EXIT" # FIX 3: 15m
 
             if exit_reason:
                 p_pct = round(pnl * 100, 2)
@@ -139,13 +149,13 @@ class Dashboard(BaseHTTPRequestHandler):
             current_pnl = round(((STATE["last_price"] - STATE["entry_price"]) / STATE["entry_price"]) * (1 if STATE["direction"]=="LONG" else -1) * 100, 2)
 
         html = f"""
-        <html><head><title>GCR_V6</title>
+        <html><head><title>GCR_V7</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
             body {{ background:#050505; color:#0f0; font-family:monospace; padding:15px; }}
             .container {{ border:1px solid #0f0; padding:15px; max-width:600px; margin:auto; box-shadow:0 0 15px #0f0; }}
             .pnl {{ font-size:3em; text-align:center; color:{'#0f0' if current_pnl >= 0 else '#f00'}; }}
-            .box {{ background:#111; padding:10px; height:150px; overflow-y:scroll; font-size:0.7em; color:#888; white-space:pre-wrap; margin-top:10px; border:1px solid #222; }}
+            .box {{ background:#111; padding:10px; height:150px; overflow-y:scroll; font-size:0.7em; color:#888; white-space: pre-wrap; margin-top:10px; border:1px solid #222; }}
             .debug {{ color:#555; height:200px; }}
             .btn {{ width:100%; padding:10px; background:#0f0; border:none; font-weight:bold; cursor:pointer; margin-top:10px; }}
             .label {{ font-size:0.6em; color:#444; margin-top:10px; text-transform:uppercase; }}
@@ -154,7 +164,7 @@ class Dashboard(BaseHTTPRequestHandler):
             <div class="container">
                 <div style="display:flex; justify-content:space-between; font-size:0.7em;">
                     <span>BTC: {STATE['last_price']}</span>
-                    <span>TRADES: {len(STATE['pnl_history'])}</span>
+                    <span>PNL_AVG: {round(sum(STATE['pnl_history'])/max(1,len(STATE['pnl_history'])),2)}%</span>
                 </div>
                 <div class="pnl">{current_pnl}%</div>
                 
